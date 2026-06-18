@@ -6,9 +6,11 @@ five_house_weighted.py
 하우스 가중치:
   GS 28% / MS 27% / Citi 18% / JPM 18% / Bloomberg 9%
 
-시나리오:
-  S1 합의 (10%)  S2 에너지 인프라 타격 (40%)
-  S3 6주 장기화 (30%)  S4 봉쇄+미국 철군 (20%)
+시나리오 (2026-06-18 업데이트):
+  S1 합의·호르무즈 재개방 (60%)  ← 미국-이란 60일 MOU 체결 현실화
+  S2 에너지 인프라 타격 (15%)    ← Trump 경고 발언, 불확실성 잔존
+  S3 장기화 (15%)               ← 협상 결렬 시 재봉쇄 가능성
+  S4 봉쇄+미국 철군 (10%)        ← 극단 시나리오
 
 pip install numpy scipy matplotlib
 python3 five_house_weighted.py
@@ -25,7 +27,7 @@ matplotlib.rcParams["font.family"] = "DejaVu Sans"
 # ─────────────────────────────────────────
 # 파라미터
 # ─────────────────────────────────────────
-WTI_SPOT = 98.34
+WTI_SPOT = 75.54  # 2026-06-18 실제가 (NYMEX CL=F)
 
 HOUSE_WEIGHTS = {
     "Goldman Sachs":   0.28,
@@ -35,22 +37,26 @@ HOUSE_WEIGHTS = {
     "Bloomberg":       0.09,
 }
 
-# 시나리오 확률
+# 시나리오 확률 — 2026-06-18 업데이트
+# 미국-이란 60일 MOU 체결, 호르무즈 재개방 진행 중
+# IEA: 2027년 공급 +8mb/d vs 수요 +2mb/d 과잉 경고
 SCENARIO_PROBS = {
-    "S1_Agreement":     0.10,
-    "S2_Strike":        0.40,
-    "S3_Prolonged":     0.30,
-    "S4_Withdrawal":    0.20,
+    "S1_Agreement":     0.60,   # 60%: 합의·재개방 현실화 (구 10%)
+    "S2_Strike":        0.15,   # 15%: 재점화 리스크 (구 40%, Trump 경고 잔존)
+    "S3_Prolonged":     0.15,   # 15%: 협상 결렬·장기화 (구 30%)
+    "S4_Withdrawal":    0.10,   # 10%: 극단 봉쇄 (구 20%)
 }
 
-# 5사 × 4 시나리오 WTI 목표가
+# 5사 × 4 시나리오 WTI 목표가 — 2026-06-18 업데이트
+# S1: 공급 정상화 + IEA 과잉 반영 → 하향
+# S2~S4: 재점화 시나리오 유지 (지정학 프리미엄)
 TARGETS = {
     #                     S1    S2    S3    S4
-    "Goldman Sachs":   [  77,  110,  125,   96],
-    "Morgan Stanley":  [  72,  113,  120,   95],
-    "Citigroup":       [  75,  120,  140,  105],
-    "JPMorgan":        [  78,  115,  122,  105],
-    "Bloomberg":       [  80,  122,  160,  107],
+    "Goldman Sachs":   [  72,  100,  115,   88],  # S1 $77→$72 (IEA 과잉)
+    "Morgan Stanley":  [  68,  103,  110,   87],  # S1 $72→$68
+    "Citigroup":       [  70,  108,  128,   95],  # S1 $75→$70
+    "JPMorgan":        [  73,  105,  112,   97],  # S1 $78→$73
+    "Bloomberg":       [  74,  110,  145,   98],  # S1 $80→$74 (과잉 민감)
 }
 
 SCENARIOS = list(SCENARIO_PROBS.keys())
@@ -59,8 +65,8 @@ WEIGHTS   = np.array([HOUSE_WEIGHTS[h] for h in HOUSES])
 PROBS     = np.array([SCENARIO_PROBS[s] for s in SCENARIOS])
 TARGET_MATRIX = np.array([TARGETS[h] for h in HOUSES])  # (5, 4)
 
-# 변동성 (시나리오별 표준편차 가정)
-SIGMA = {"S1_Agreement": 5.0, "S2_Strike": 12.0, "S3_Prolonged": 18.0, "S4_Withdrawal": 10.0}
+# 변동성 (시나리오별 표준편차) — S1 변동성 축소 (합의 불확실성 감소)
+SIGMA = {"S1_Agreement": 4.0, "S2_Strike": 14.0, "S3_Prolonged": 20.0, "S4_Withdrawal": 12.0}
 
 # ─────────────────────────────────────────
 # 연산

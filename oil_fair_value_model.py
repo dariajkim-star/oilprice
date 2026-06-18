@@ -48,29 +48,37 @@ rng = np.random.default_rng(seed)
 t = np.arange(T)
 
 # WTI Spot (실제 데이터 교체 포인트 ①)
-wti_spot = 80 + np.cumsum(rng.normal(0, 0.8, T))
-wti_spot = np.clip(wti_spot, 50, 160)
+# 2026-06-18 기준: $75.54 (미국-이란 MOU, 호르무즈 재개방 진행)
+wti_spot = 75.54 + np.cumsum(rng.normal(0, 0.8, T))
+wti_spot = np.clip(wti_spot, 40, 160)
 
 # 공급 갭 (mb/d, + = 과잉공급)  (실제 교체 포인트 ②: OPEC API)
-supply_gap = rng.normal(0, 1.2, T)
+# IEA 2027년 과잉 +6mb/d 반영 → 양수(과잉) 편향
+supply_gap = rng.normal(0.8, 1.2, T)  # 구: 0 → 0.8 (IEA 과잉 반영)
 
 # EIA 상업 재고 변화 (Mbbl)  (실제 교체 포인트 ③: EIA API)
-eia_stock = rng.normal(-0.5, 3.0, T)
+# 최근 주간 -8.3 Mbbl 감소 → 평균 소폭 음수
+eia_stock = rng.normal(-1.5, 3.0, T)  # 구: -0.5 → -1.5
 
 # SPR 잔여 (Mbbl)  (실제 교체 포인트 ④: EIA API)
-spr_level = 350 + np.cumsum(rng.normal(-0.2, 1.5, T))
+# 봉쇄 기간 중 SPR 방출로 잔여량 감소 반영
+spr_level = 320 + np.cumsum(rng.normal(-0.1, 1.5, T))  # 구: 350 → 320
 
 # DXY  (실제 교체 포인트 ⑤: FRED DXY)
-dxy = 100 + np.cumsum(rng.normal(0, 0.3, T))
+dxy = 103 + np.cumsum(rng.normal(0, 0.3, T))  # 구: 100 → 103 (달러 강세)
 
 # OVX (원유 변동성 지수)  (실제 교체 포인트 ⑥: Yahoo Finance ^OVX)
-ovx = 25 + 10 * np.abs(rng.normal(0, 1, T))
+# 재개방 기대로 변동성 다소 안정 → 평균 하향
+ovx = 30 + 8 * np.abs(rng.normal(0, 1, T))  # 구: 25+10 → 30+8
 
 # 호르무즈 선박수 (7dMA)  (실제 교체 포인트 ⑦: IMF PortWatch)
-vessel_count = np.clip(138 - rng.exponential(20, T), 0, 138)
+# 2026-04 기준 6척 → 재개방 진행 중 → 점진 회복 시뮬레이션
+vessel_recovery = np.clip(np.linspace(6, 80, T), 0, 138)  # 6→80 점진 회복
+vessel_count = np.clip(vessel_recovery + rng.normal(0, 8, T), 0, 138)
 
 # 선물 커브 기울기 (3M - spot)  (실제 교체 포인트 ⑧: CME)
-futures_slope = rng.normal(1.5, 0.8, T)
+# 콘탱고(backwardation 해소): 재개방 기대 → 근월물 하락
+futures_slope = rng.normal(2.5, 0.8, T)  # 구: 1.5 → 2.5 (콘탱고 심화)
 
 
 # ─────────────────────────────────────────
@@ -303,8 +311,8 @@ ax.fill_between(t, 0, overshoot,
                 where=(overshoot <= 0), color=GREEN, alpha=0.5, label="Under")
 ax.plot(t, overshoot, color=WHITE, linewidth=0.6)
 ax.axhline(0, color=BORDER, linewidth=1.0)
-ax.axhline(+10, color=RED, linestyle="--", linewidth=0.8, label="+10 Alert")
-ax.axhline(-20, color=GREEN, linestyle="--", linewidth=0.8, label="-20 Alert")
+ax.axhline(+8,  color=RED,   linestyle="--", linewidth=0.8, label="+8 Alert (구 +10)")
+ax.axhline(-12, color=GREEN, linestyle="--", linewidth=0.8, label="-12 Alert (구 -20)")
 ax.legend(fontsize=7, labelcolor=WHITE, facecolor=CARD, edgecolor=BORDER)
 ax.set_ylabel("USD", color=GRAY, fontsize=8)
 

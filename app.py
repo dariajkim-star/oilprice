@@ -64,19 +64,24 @@ HOUSE_WEIGHTS = {
     "Citigroup":      0.18, "JPMorgan":       0.18,
     "Bloomberg":      0.09,
 }
+# 2026-06-18 업데이트: 미국-이란 MOU 60일, 호르무즈 재개방 진행
 SCENARIO_PROBS = {
-    "S1_Agreement": 0.10, "S2_Strike":     0.40,
-    "S3_Prolonged": 0.30, "S4_Withdrawal": 0.20,
+    "S1_Agreement": 0.60,  # 구 0.10 → 합의·재개방 현실화
+    "S2_Strike":    0.15,  # 구 0.40 → Trump 경고 잔존, 재점화 리스크
+    "S3_Prolonged": 0.15,  # 구 0.30 → 협상 결렬 시 재봉쇄
+    "S4_Withdrawal":0.10,  # 구 0.20 → 극단 시나리오
 }
+# 5사 × 4 시나리오 WTI 목표가 — 2026-06-18 업데이트
+# S1: 공급 정상화 + IEA 과잉 반영 → 하향
 TARGETS = {
-    "Goldman Sachs":  [ 77, 110, 125,  96],
-    "Morgan Stanley": [ 72, 113, 120,  95],
-    "Citigroup":      [ 75, 120, 140, 105],
-    "JPMorgan":       [ 78, 115, 122, 105],
-    "Bloomberg":      [ 80, 122, 160, 107],
+    "Goldman Sachs":  [ 72, 100, 115,  88],  # S1: $77→$72
+    "Morgan Stanley": [ 68, 103, 110,  87],  # S1: $72→$68
+    "Citigroup":      [ 70, 108, 128,  95],  # S1: $75→$70
+    "JPMorgan":       [ 73, 105, 112,  97],  # S1: $78→$73
+    "Bloomberg":      [ 74, 110, 145,  98],  # S1: $80→$74
 }
-SIGMA = {"S1_Agreement": 5.0, "S2_Strike": 12.0,
-          "S3_Prolonged": 18.0, "S4_Withdrawal": 10.0}
+SIGMA = {"S1_Agreement": 4.0, "S2_Strike": 14.0,
+          "S3_Prolonged": 20.0, "S4_Withdrawal": 12.0}  # S1 변동성 축소
 
 FORECAST_HORIZONS = [7, 14, 30, 60, 90]
 
