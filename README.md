@@ -1,4 +1,4 @@
-# OilPriceValuation — KFBI 금융시장분석팀 내부용
+# OilPriceValuation — KFBI 금융시장분석팀
 
 > **Operation Roaring Lion (2026.02.28~)** 호르무즈 봉쇄 상황에서  
 > WTI/Brent 적정가 산출 및 시장 리스크 자동 모니터링 시스템
