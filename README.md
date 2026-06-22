@@ -4,7 +4,9 @@
 > WTI/Brent 적정가 산출 및 시장 리스크 자동 모니터링 시스템
 >
 > **최종 파라미터 업데이트: 2026-06-18**  
-> 미국-이란 60일 MOU 체결, 호르무즈 재개방 진행, IEA 공급 과잉 경고 반영
+> 미국-이란 60일 MOU 체결, 호르무즈 재개방 진행, IEA 공급 과잉 경고 반영  
+> **아키텍처 업데이트: 2026-06-22**  
+> 크롤링 모듈 분리(`data_crawler.py`), ML 파이프라인 분류→회귀 2단계 전환
 
 ---
 
@@ -13,12 +15,30 @@
 ```
 oilpricevaluation/
 │
+├── data_crawler.py            # ★ 크롤링 전용 모듈 (API 과사용 방지, 3시간 데몬)
+├── app.py                     # Flask 통합 대시보드 (크롤링은 data_crawler 위임)
 ├── hormuz_monitor.py          # 호르무즈 실시간 모니터링 데몬
 ├── five_house_weighted.py     # 5사 가중치 시나리오 분석 + Monte Carlo
 ├── oil_fair_value_model.py    # MS Kalman + GS Bridge + RF 통합 모델 (Streamlit)
-├── app.py                     # Flask 통합 대시보드 (전체 기능 통합)
 ├── market_sentiment_pipeline.py  # 뉴스/SNS 감성 분석 파이프라인
 ├── nasdaq_mc_v2.py            # Nasdaq Monte Carlo (Merton JDM + 레짐 스위칭)
+├── data/                      # ★ 크롤링 결과 CSV 중앙 저장소
+│   ├── yahoo_finance_wti.csv
+│   ├── yahoo_finance_brent.csv
+│   ├── yahoo_finance_dxy.csv
+│   ├── yahoo_finance_ovx.csv
+│   ├── yahoo_finance_uso.csv
+│   ├── yahoo_finance_bno.csv
+│   ├── yahoo_finance_futures_curve.csv
+│   ├── brent_wti_spread.csv
+│   ├── eia_commercial_inventory.csv
+│   ├── eia_spr.csv
+│   ├── eia_wpsr_gasoline.csv
+│   ├── eia_wpsr_distillate.csv
+│   ├── macro_snapshot.csv
+│   ├── arcgis_hormuz.csv
+│   ├── straits_live_snapshot.csv
+│   └── portwatch_cache.csv    # hormuz_monitor 캐시 (구: 루트 저장 → data/ 이동)
 └── README.md
 ```
 
@@ -27,11 +47,30 @@ oilpricevaluation/
 ## 전체 데이터 흐름
 
 ```
-Yahoo Finance (WTI CL=F, 15분 딜레이 실시간)
-FRED DCOILWTICO (전일 확정, API 키 불필요)
-EIA API v2 (주간 확정, 최대 5일 래그 — 참고용)    ┐
-IMF PortWatch ArcGIS (선박수/속도/톤수)             ├──▶ hormuz_monitor.py ──▶ 알림 출력
-                                                   ┘
+Yahoo Finance (WTI/Brent/DXY/OVX/USO/BNO + 선물커브 M1~M6)
+EIA API v2    (상업재고·SPR·WPSR 가솔린·중간유)
+IMF PortWatch ArcGIS (호르무즈 일별 선박 365일)
+straits.live  (호르무즈 실시간 스냅샷)
+매크로 10종   (TNX·SP500·Gold·Copper·VIX·TIP·XLI·FXI·MCHI·MSCI)
+        │
+        ▼
+  data_crawler.py   ←── python data_crawler.py --daemon  (3시간 간격 자동 실행)
+        │  CSV → data/
+        ▼
+  data/ (중앙 저장소)
+        │
+        ├──▶ app.py          (Flask 대시보드, data_crawler에서 임포트)
+        │      ├── MS Kalman Filter (잠재 펀더멘털)
+        │      ├── GS Two-Stage Bridge (수급 → 지정학 프리미엄)
+        │      ├── RF Supply Shock Index
+        │      ├── ML 예측: RF 분류(방향) → RF 회귀(크기) 2단계  ← ★ 2026-06-22 변경
+        │      ├── Monte Carlo GBM (30/60/90일)
+        │      └── 5사 가중 시나리오 EV
+        │
+        └──▶ hormuz_monitor.py  (portwatch_cache.csv → data/ 저장)
+                │
+                ▼
+             알림 출력
 
 뉴스/SNS 크롤링 데이터 (JSON/CSV)
         │
@@ -40,15 +79,6 @@ market_sentiment_pipeline.py
         │  fear_index (0~100)
         ▼
 nasdaq_mc_v2.py ──▶ Nasdaq 경로 시뮬레이션 + VaR
-
-Yahoo Finance + EIA + IMF PortWatch + FRED + 매크로
-        │
-        ▼
-app.py  (Flask 통합 대시보드)
-   ├── oil_fair_value  (MS Kalman + GS Bridge + RF)
-   ├── 5사 시나리오 EV
-   ├── MC 가격 예측 (30/60/90일)
-   └── 탱커 수 예측
 
 app.py / oil_fair_value_model.py 결과
         │
@@ -59,6 +89,41 @@ five_house_weighted.py  (5사 가중 시나리오 EV 독립 실행)
 ---
 
 ## 파일별 상세
+
+### 0. `data_crawler.py` — 크롤링 전용 모듈 ★ 2026-06-22 신규
+
+**역할:** 모든 API 호출을 `app.py`에서 분리하여 API 과사용 방지 및 독립 실행 가능
+
+**수집 소스 (1회 실행 기준):**
+
+| 소스 | 데이터 | 저장 파일 |
+|---|---|---|
+| Yahoo Finance | WTI·Brent·DXY·OVX·USO·BNO (1년 일별) | `yahoo_finance_*.csv` |
+| Yahoo Finance | WTI 선물 커브 M1~M6 | `yahoo_finance_futures_curve.csv` |
+| Yahoo Finance | 매크로 10종 (TNX·SP500·Gold·Copper·VIX 등) | `macro_snapshot.csv` |
+| EIA API v2 | 상업재고 60주, SPR 60주 | `eia_commercial_inventory.csv`, `eia_spr.csv` |
+| EIA WPSR | 가솔린·중간유 재고 60주 | `eia_wpsr_gasoline.csv`, `eia_wpsr_distillate.csv` |
+| ArcGIS FeatureServer | 호르무즈 일별 선박 365일 | `arcgis_hormuz.csv` |
+| straits.live | 호르무즈 현황 스냅샷 | `straits_live_snapshot.csv` |
+| 계산값 | Brent-WTI 스프레드 | `brent_wti_spread.csv` |
+
+**캐시 TTL:** 3600초 (1시간) — 앱 재시작마다 재크롤링 방지
+
+**실행:**
+```bash
+python data_crawler.py                      # 1회 실행 (TTL 내 캐시 재사용)
+python data_crawler.py --force              # 강제 재크롤링
+python data_crawler.py --daemon             # 3시간 간격 무한 반복
+python data_crawler.py --daemon --interval 90  # 90분 간격으로 변경
+```
+
+**`app.py` 연동:**
+```python
+from data_crawler import fetch_all_data, CSV_DIR, EIA_KEY, EIA_BASE, _cache
+```
+`app.py`는 직접 API를 호출하지 않고 `data_crawler.fetch_all_data()`만 호출함.
+
+---
 
 ### 1. `hormuz_monitor.py` — 실시간 모니터링 데몬
 
@@ -101,6 +166,8 @@ five_house_weighted.py  (5사 가중 시나리오 EV 독립 실행)
 ```
 https://services9.arcgis.com/weJ1QsnbMYJlCHdG/ArcGIS/rest/services/Daily_Chokepoints_Data/FeatureServer/0/query
 ```
+
+**캐시 저장 경로 (2026-06-22 변경):** `portwatch_cache.csv` (프로젝트 루트) → `data/portwatch_cache.csv`
 
 **스케줄 (데몬 모드):** KST 08:00, 10:00 고정 + 12:00, 14:00, 16:00, 18:00, 20:00, 22:00
 
@@ -178,23 +245,40 @@ streamlit run oil_fair_value_model.py
 
 ### 4. `app.py` — Flask 통합 대시보드
 
-**역할:** 전체 기능을 하나의 웹 대시보드로 통합 (실시간 크롤링 + 모든 모델)
+**역할:** 전체 기능을 하나의 웹 대시보드로 통합. 크롤링은 `data_crawler.py`에 위임.
 
-**5사 시나리오 파라미터:** `five_house_weighted.py`와 동일하게 2026-06-18 업데이트 완료
+**2026-06-22 아키텍처 변경:**
+- 크롤링 코드 전량 `data_crawler.py`로 이동 (`app.py`는 `fetch_all_data()` 호출만 함)
+- ML 파이프라인: **순수 회귀 → 분류(방향)→회귀(크기) 2단계**로 전환
 
-**추가 데이터 소스 (README 구버전 미기재):**
+**ML 2단계 파이프라인 상세:**
+
+| 단계 | 모델 | 목표 | 하이퍼파라미터 튜닝 |
+|---|---|---|---|
+| Stage 1 | RF Classifier | 방향 분류 (-1=하락 / 0=중립 / +1=상승) | `scoring="balanced_accuracy"`, `class_weight="balanced"` |
+| Stage 2 | RF Regressor | 수익률 크기 예측 | `scoring="neg_mean_absolute_error"` |
+| 결합 | — | 방향 일치 → 원값 / 불일치 → 절댓값×0.5 / 중립 → ×0.2 | — |
+
+- 방향 기준: `DIRECTION_THRESHOLD = ±0.5%` (이내는 중립 0)
+- 공통: `TimeSeriesSplit(n_splits=5)` + `RandomizedSearchCV(n_iter=20)`
+- 출력 추가: `dir_label`(상승▲/중립─/하락▼), `dir_acc`(방향 정확도 %), `dir_proba`(클래스별 확률)
+
+**데이터 소스 (data_crawler.py 경유):**
 
 | 소스 | 데이터 | 비고 |
 |---|---|---|
-| FRED DCOILWTICO / DCOILBRENTEU | WTI·Brent 일별 확정가 | 키 불필요 |
 | Yahoo Finance USO / BNO ETF | 원유 ETF 가격 | WTI·Brent 프록시 |
 | Yahoo Finance ^TNX, ^GSPC, URTH, GC=F, HG=F, ^VIX, TIP, XLI, FXI, MCHI | 매크로 10종 | GS Bridge Stage B 보강 |
-| EIA WPSR 가솔린·중간유·수입량 | 정제·수요 수급 | RF 피처 확장 |
+| EIA WPSR 가솔린·중간유 재고 | 정제·수요 수급 | RF 피처 확장 |
 | straits.live | 호르무즈 현황 스냅샷 | 보조 지표 |
 | WTI 선물 커브 M1~M6 | 콘탱고/백워데이션 | Stage B 피처 |
 
 **실행:**
 ```bash
+# 크롤링 먼저 (최초 1회 또는 데몬 상시 실행)
+python data_crawler.py --daemon
+
+# 대시보드 실행
 pip install flask yfinance requests pandas numpy scikit-learn matplotlib
 python app.py
 # → http://localhost:5000
@@ -316,14 +400,14 @@ SPR 잔여                   : petroleum/stoc/wstk →  facets[series][]=W_EPC0_
 ## 설치 (한 번만)
 
 ```bash
-# 기본 (hormuz_monitor + five_house_weighted + oil_fair_value_model)
-pip install requests pandas numpy scipy matplotlib schedule yfinance
+# 크롤러 + Flask 대시보드 (data_crawler.py + app.py)
+pip install requests pandas numpy scipy matplotlib yfinance scikit-learn flask beautifulsoup4
+
+# 호르무즈 모니터 + 5사 시나리오
+pip install schedule
 
 # Streamlit (oil_fair_value_model.py)
-pip install streamlit scikit-learn
-
-# Flask 통합 대시보드 (app.py)
-pip install flask
+pip install streamlit
 
 # 감성 파이프라인 (market_sentiment_pipeline.py)
 pip install plotly wordcloud
@@ -340,21 +424,27 @@ pip install plotly scipy
 ## 전체 실행 순서
 
 ```bash
-# Step 1: 호르무즈 모니터 (현재 상황 확인)
-python hormuz_monitor.py
+# Step 0: 데이터 크롤링 (최초 1회 필수 — data/ 폴더에 CSV 저장)
+python data_crawler.py --force
 
-# Step 2: 데몬 모드 (백그라운드 상시 모니터링)
-python hormuz_monitor.py --daemon
+# Step 0-daemon: 3시간 간격 자동 갱신 (백그라운드 상시 실행 권장)
+python data_crawler.py --daemon
 
-# Step 3: 5사 시나리오 분석 차트
-python five_house_weighted.py
-
-# Step 4: 통합 공정가 모델 (Streamlit)
-streamlit run oil_fair_value_model.py
-
-# Step 5: Flask 통합 대시보드 (전체 기능)
+# Step 1: Flask 통합 대시보드 (크롤링 후 실행)
 python app.py
 # → http://localhost:5000
+
+# Step 2: 호르무즈 모니터 1회 확인
+python hormuz_monitor.py
+
+# Step 3: 호르무즈 모니터 데몬
+python hormuz_monitor.py --daemon
+
+# Step 4: 5사 시나리오 분석 차트
+python five_house_weighted.py
+
+# Step 5: 통합 공정가 모델 (Streamlit)
+streamlit run oil_fair_value_model.py
 
 # Step 6: 감성 분석 (크롤링 데이터 있을 때)
 python market_sentiment_pipeline.py --input crawled_data.json
@@ -381,9 +471,13 @@ run(fear_index=s['fear_index'])
 | IMF PortWatch 래그 | 매주 화요일 오전 9시 ET 업데이트, 실제 2~4일 래그 |
 | AIS 스푸핑 | 분쟁 지역 특성상 실제 통과 선박보다 수치 낮을 수 있음 |
 | EIA WTI | 주간 데이터 — 알림 판단에 Yahoo Finance 사용, EIA는 재고·SPR 용도만 권장 |
+| EIA 생산량·원유수입 | DEMO_KEY rate limit 또는 facet 파라미터 문제로 간헐적 SIM 전환 |
+| FRED WTI/Brent | 공개 CSV 엔드포인트 간헐적 차단 — yfinance 데이터로 대체됨 |
 | GS house view | `GS_MAR23_WTI = 80.0` — 신규 리포트 시 수동 업데이트 |
 | FinBERT | GPU 없으면 느림. CPU 동작하나 lexicon 모드 권장 |
 | straits.live | HTML 구조 변경 시 스크래핑 패턴 수동 업데이트 필요 |
+| data/ CSV 누적 | 현재 최신 스냅샷 1개만 유지 (덮어쓰기 방식) — 히스토리 필요 시 파일명에 날짜 추가 필요 |
+| data_crawler.py 터미널 출력 | Windows CP949 환경에서 한글 깨짐 (데이터 저장은 UTF-8-BOM으로 정상) |
 
 ---
 

@@ -15,6 +15,7 @@ hormuz_monitor.py
 pip install requests pandas schedule
 """
 
+import os
 import sys
 import json
 import time
@@ -79,7 +80,10 @@ CSV_URL = (
     "https://data-download.imf.org/climatedata/"
     "portwatch-chokepoints-indicators.csv"
 )
-CACHE_CSV = "portwatch_cache.csv"
+_BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
+_DATA_DIR  = os.path.join(_BASE_DIR, "data")
+os.makedirs(_DATA_DIR, exist_ok=True)
+CACHE_CSV  = os.path.join(_DATA_DIR, "portwatch_cache.csv")
 
 
 def fetch_portwatch() -> dict:

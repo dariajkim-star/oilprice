@@ -1,9 +1,7 @@
 """
-app.py - Oil Analysis Dashboard (Light Mode, Full Crawling)
-크롤링 소스:
-  [1] yfinance      : WTI(CL=F), Brent(BZ=F), DXY(DX-Y.NYB), OVX(^OVX), WTI선물커브
-  [2] EIA DEMO_KEY  : 상업재고(WCESTUS1), 전체재고(SAE→SPR 유도), 미국 생산량
-  [3] IMF PortWatch : 호르무즈 선박수/속도/톤수 (응답 실패 시 시장 프록시로 대체)
+app.py - Oil Analysis Dashboard (Light Mode)
+크롤링:  data_crawler.py 모듈에서 담당 (API 과사용 방지 분리)
+ML 흐름: 분류(방향 -1/0/+1) → 회귀(크기 예측) 2단계 파이프라인
 모델:
   - MS-style Kalman Filter (잠재 펀더멘털)
   - GS Two-Stage Bridge (수급 → 지정학 프리미엄)
@@ -11,33 +9,19 @@ app.py - Oil Analysis Dashboard (Light Mode, Full Crawling)
   - Monte Carlo 30/60/90일 가격 예측
 """
 
-import io, base64, datetime, requests, warnings, os
+import io, base64, datetime, warnings, os
 import numpy as np
 import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from sklearn.ensemble import RandomForestRegressor
+from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
 from sklearn.preprocessing import StandardScaler
 from flask import Flask, render_template_string, jsonify
-import yfinance as yf
 
-try:
-    from dotenv import load_dotenv
-    load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
-except ImportError:
-    pass
-
-# ── CSV 저장 경로 ──────────────────────────────────────────
-CSV_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
-os.makedirs(CSV_DIR, exist_ok=True)
-
-
-def _save_csv(filename: str, df: pd.DataFrame) -> str:
-    """data/ 폴더에 CSV 저장, 저장 경로 반환."""
-    path = os.path.join(CSV_DIR, filename)
-    df.to_csv(path, index=False, encoding="utf-8-sig")
-    return path
+# 크롤링 모듈 분리 — API 과사용 방지
+import requests
+from data_crawler import fetch_all_data, CSV_DIR, EIA_KEY, EIA_BASE, _cache
 
 warnings.filterwarnings("ignore")
 matplotlib.rcParams["font.family"] = "DejaVu Sans"
@@ -85,666 +69,10 @@ SIGMA = {"S1_Agreement": 4.0, "S2_Strike": 14.0,
 
 FORECAST_HORIZONS = [7, 14, 30, 60, 90]
 
-# EIA API 키: .env 파일 또는 환경변수 EIA_API_KEY 우선, 없으면 DEMO_KEY
-# 무료 등록: https://www.eia.gov/opendata/register.php  |  DEMO_KEY: 일 500회/분 5회 한도
-EIA_KEY  = os.getenv("EIA_API_KEY", "DEMO_KEY")
-EIA_BASE = "https://api.eia.gov/v2"
-
-# ══════════════════════════════════════════════════════════
-# 1. 크롤링 계층
-# ══════════════════════════════════════════════════════════
-_cache: dict = {"data": None, "ts": None}
-CACHE_TTL = 300
-
-
-def _eia_fetch(path: str, facets: dict, length: int = 60,
-               retries: int = 3, backoff: float = 4.0) -> list:
-    """EIA API v2 호출 → data 배열 반환. 429 시 최대 retries회 재시도."""
-    import time
-    params: dict = {
-        "api_key": EIA_KEY,
-        "frequency": "weekly",
-        "data[0]": "value",
-        "sort[0][column]": "period",
-        "sort[0][direction]": "desc",
-        "offset": 0,
-        "length": length,
-    }
-    for k, v in facets.items():
-        params[k] = v
-    for attempt in range(retries):
-        try:
-            r = requests.get(f"{EIA_BASE}/{path}", params=params, timeout=12)
-            if r.status_code == 429:
-                wait = backoff * (attempt + 1)
-                time.sleep(wait)
-                continue
-            r.raise_for_status()
-            return r.json().get("response", {}).get("data", [])
-        except Exception:
-            if attempt < retries - 1:
-                import time as _t; _t.sleep(backoff)
-    return []
-
-
-def _eia_series(rows: list) -> np.ndarray:
-    """EIA 레코드 → 시간순 float 배열 (오래된 것부터)."""
-    vals = []
-    for row in reversed(rows):
-        try:
-            vals.append(float(row["value"]))
-        except Exception:
-            pass
-    return np.array(vals) if vals else np.array([])
-
-
-def _fred_series(series_id: str, limit: int = 365) -> tuple:
-    """
-    FRED 무료 공개 CSV 엔드포인트 → (값 배열, 날짜 리스트).
-    API 키 불필요.  주요 시리즈:
-      DCOILWTICO  = WTI spot ($/bbl, 일별)
-      DCOILBRENTEU = Brent spot ($/bbl, 일별)
-    """
-    from io import StringIO
-    url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
-    try:
-        r = requests.get(url, timeout=12, headers={"User-Agent": "Mozilla/5.0"})
-        r.raise_for_status()
-        df = pd.read_csv(StringIO(r.text))
-        df.columns = ["date", "value"]
-        df["value"] = pd.to_numeric(df["value"], errors="coerce")
-        df = df.dropna().tail(limit)
-        return df["value"].values.astype(float), df["date"].tolist()
-    except Exception:
-        return None, []
-
-
-def _yf_macro() -> dict:
-    """
-    매크로 지표 yfinance 배치 수집 (1회 호출로 10개 티커 동시 다운로드).
-      ^TNX  : 미국 10년물 국채 수익률
-      ^GSPC : S&P 500
-      URTH  : MSCI World ETF
-      GC=F  : 금 선물 (안전자산/지정학)
-      HG=F  : 구리 선물 (글로벌 제조업)
-      ^VIX  : VIX 공포지수
-      TIP   : TIPS ETF → CPI/인플레 프록시
-      XLI   : 산업재 ETF → ISM PMI 프록시
-      FXI   : iShares China ETF → 중국 PMI 프록시
-      MCHI  : MSCI China ETF (중국 경기 보완)
-    """
-    name_map = {
-        "^TNX":  "TNX",   "^GSPC": "SP500",
-        "URTH":  "MSCI_World",
-        "GC=F":  "Gold",  "HG=F":  "Copper",
-        "^VIX":  "VIX",   "TIP":   "TIP",
-        "XLI":   "XLI",   "FXI":   "FXI",
-        "MCHI":  "MCHI",
-    }
-    result: dict = {}
-    try:
-        # 배치 다운로드 - 1회 HTTP 요청으로 처리
-        raw = yf.download(
-            list(name_map.keys()),
-            period="1y", interval="1d",
-            progress=False, auto_adjust=True, group_by="ticker",
-        )
-        for tick, name in name_map.items():
-            try:
-                col = raw[tick]["Close"] if tick in raw.columns.get_level_values(0) else None
-                if col is None:
-                    continue
-                series = col.dropna().values.astype(float).flatten()
-                if len(series) < 5:
-                    continue
-                result[name] = {
-                    "series":  series,
-                    "latest":  float(series[-1]),
-                    "chg_pct": float((series[-1] / series[-2] - 1) * 100),
-                    "ticker":  tick,
-                }
-            except Exception:
-                pass
-    except Exception:
-        pass
-    # 개별 fallback
-    for tick, name in name_map.items():
-        if name not in result:
-            try:
-                df = yf.download(tick, period="1y", interval="1d",
-                                 progress=False, auto_adjust=True)
-                arr = df["Close"].dropna().values.astype(float).flatten()
-                if len(arr) >= 5:
-                    result[name] = {
-                        "series":  arr,
-                        "latest":  float(arr[-1]),
-                        "chg_pct": float((arr[-1] / arr[-2] - 1) * 100),
-                        "ticker":  tick,
-                    }
-            except Exception:
-                pass
-    return result
-
-
-def _eia_wpsr() -> dict:
-    """
-    EIA Weekly Petroleum Status Report 추가 시리즈.
-      - 가솔린 재고  (EPM0F + SAE + NUS)
-      - 중간유 재고  (EPD0  + SAE + NUS)
-      - 원유 수입량  (EPC0  + SAI + NUS)
-    반환 dict: {"gasoline": arr, "distillate": arr, "crude_imports": arr}
-    """
-    import time as _t
-    series_config = [
-        ("gasoline",      "petroleum/stoc/wstk/data/",
-         {"facets[product][]": "EPM0F", "facets[duoarea][]": "NUS",
-          "facets[process][]": "SAE"}),
-        ("distillate",    "petroleum/stoc/wstk/data/",
-         {"facets[product][]": "EPD0",  "facets[duoarea][]": "NUS",
-          "facets[process][]": "SAE"}),
-        ("crude_imports", "petroleum/move/wkly/data/",
-         {"facets[product][]": "EPC0",  "facets[duoarea][]": "NUS",
-          "facets[process][]": "SAI"}),
-    ]
-    result: dict = {}
-    for name, path, facets in series_config:
-        _t.sleep(3)
-        rows = _eia_fetch(path, facets, length=60)
-        arr  = _eia_series(rows)
-        result[name]         = arr if len(arr) > 4 else None
-        result[f"{name}_rows"] = rows
-    return result
-
-
-_ARCGIS_URL = (
-    "https://services9.arcgis.com/weJ1QsnbMYJlCHdG/ArcGIS/rest/services"
-    "/Daily_Chokepoints_Data/FeatureServer/0/query"
-)
-
-
-def _arcgis_hormuz(n_records: int = 365) -> dict:
-    """
-    ArcGIS FeatureServer에서 호르무즈(chokepoint6) 일별 선박 데이터 수집.
-    반환 필드: date, n_tanker, n_total, capacity_tanker, capacity,
-               n_dry_bulk, n_container
-    """
-    try:
-        r = requests.get(
-            _ARCGIS_URL,
-            params={
-                "where":             "portid='chokepoint6'",
-                "outFields":         "date,n_tanker,n_total,capacity_tanker,"
-                                     "capacity,n_dry_bulk,n_container,n_roro",
-                "orderByFields":     "date DESC",
-                "resultRecordCount": n_records,
-                "f":                 "json",
-            },
-            timeout=15,
-        )
-        r.raise_for_status()
-        features = r.json().get("features", [])
-        if not features:
-            return {}
-
-        rows = [f["attributes"] for f in features]
-        # 시간순 정렬 (오래된 것부터)
-        rows = sorted(rows, key=lambda x: x.get("date", ""))
-
-        def col(key, default=0.0):
-            return np.array([float(row.get(key) or default) for row in rows])
-
-        return {
-            "dates":            [row.get("date", "") for row in rows],
-            "n_tanker":         col("n_tanker"),
-            "n_total":          col("n_total"),
-            "capacity_tanker":  col("capacity_tanker"),
-            "capacity":         col("capacity"),
-            "n_dry_bulk":       col("n_dry_bulk"),
-            "n_container":      col("n_container"),
-            "n_roro":           col("n_roro"),
-            "tanker_ratio":     col("n_tanker") / np.maximum(col("n_total"), 1),
-            "source":           _ARCGIS_URL,
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-
-def _straits_live_scrape() -> dict:
-    """
-    straits.live 페이지 스크래핑 → 호르무즈 현황 스냅샷.
-    반환: transits_today, vessels_in_transit, tankers_dark,
-          war_risk_usd_m, war_risk_multiplier, hormuz_index,
-          escalation_forecast, high_risk, moderate_risk, low_risk
-    """
-    import re
-    try:
-        from bs4 import BeautifulSoup
-    except ImportError:
-        return {"error": "beautifulsoup4 미설치"}
-
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        )
-    }
-    try:
-        r = requests.get("https://straits.live/", timeout=12, headers=headers)
-        if r.status_code != 200:
-            return {"error": f"HTTP {r.status_code}", "source": "straits.live"}
-
-        soup = BeautifulSoup(r.text, "html.parser")
-        txt  = soup.get_text(separator=" ", strip=True)
-
-        def _num(pattern, cast=float, txt=txt):
-            m = re.search(pattern, txt, re.I | re.S)
-            try:
-                raw = m.group(1).replace(",", "") if m else None
-                return cast(raw) if raw is not None else None
-            except Exception:
-                return None
-
-        return {
-            # 일별 상업적 통과 횟수 (오늘)
-            "transits_today":      _num(r"(?:Commercial\s+transit[s]?|transits?)\D{0,15}(\d+)\s*/?\s*day|(\d+)\s*transit", int),
-            # 현재 통과 중인 선박 수 (여러 표현 처리)
-            "vessels_in_transit":  _num(r"(\d+)\s+vessels?\s*(?:currently\s+)?in\s+transit|in\s+transit[:\s]+(\d+)", int),
-            # 유형별 탱커 수
-            "tankers_in_transit":  _num(r"(\d+)\s+tanker|tanker[s]?\s*[:\-]\s*(\d+)", int),
-            # AIS 소등 탱커 (숫자 먼저, 라벨 뒤)
-            "tankers_dark":        _num(r"(\d+)\s*(?:AIS.{0,15}dark|dark.{0,15}AIS|tanker.{0,15}dark)", int),
-            # AIS 소등 7일 기준선
-            "dark_baseline_7d":    _num(r"baseline\D{0,10}(\d+\.?\d*)|(\d+\.?\d*)\s*7.?d\s*baseline", float),
-            # VLCC 전쟁보험 (백만 달러)
-            "war_risk_usd_m":      _num(r"\$\s*(\d+\.?\d*)\s*[Mm]", float),
-            # 전쟁보험 배수
-            "war_risk_multiplier": _num(r"(\d+\.?\d*)\s*[×xX]\s*(?:est|pre|crisis)", float),
-            # 호르무즈 지수: "Crisis Pressure: 94" 또는 "Pressure:\s+94" 형식
-            "hormuz_index":        _num(r"Crisis\s+Pressure\D{0,5}(\d{2,3})|Hormuz\s+Index\D{0,30}Pressure\D{0,5}(\d{2,3})", float),
-            # 에스컬레이션 예측
-            "escalation_forecast": _num(r"Escalation\s+Forecast\D{0,5}(\d{2,3})", float),
-            # 위험 등급별 선박 (숫자 우선)
-            "high_risk_vessels":   _num(r"(\d+)\s*high.{0,10}risk|high.{0,10}risk\D{0,5}(\d+)", int),
-            "moderate_risk":       _num(r"(\d+)\s*moderate|moderate\D{0,5}(\d+)", int),
-            "low_risk":            _num(r"(\d+)\s*low.{0,10}risk|low.{0,10}risk\D{0,5}(\d+)", int),
-            "scraped_at":          datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "source":              "https://straits.live/",
-        }
-    except Exception as e:
-        return {"error": str(e), "source": "straits.live"}
-
-
-def _futures_curve_yf() -> dict:
-    """
-    WTI 선물 커브: 근월물(M1) + M2/M3/M6 개별 계약 가격.
-    반환: {"M1": float, "M2": float, "M3": float, "M6": float,
-            "slope": 연율화%, "contango": bool}
-    slope = (M6 - M1) / M1 * 2 * 100  (연율화)
-    fallback: M1 역사적 3개월 변화율로 slope 산출
-    """
-    now = datetime.datetime.now()
-    mc  = {1:"F",2:"G",3:"H",4:"J",5:"K",6:"M",
-           7:"N",8:"Q",9:"U",10:"V",11:"X",12:"Z"}
-    curve: dict = {}
-
-    # 근월물
-    try:
-        p = yf.Ticker("CL=F").fast_info.get("last_price")
-        if p: curve["M1"] = round(float(p), 2)
-    except Exception:
-        pass
-
-    # M2 / M3 / M6
-    for n in [2, 3, 6]:
-        dt   = now + datetime.timedelta(days=30 * (n - 1))
-        tick = f"CL{mc[dt.month]}{str(dt.year)[2:]}.NYM"
-        try:
-            p = yf.Ticker(tick).fast_info.get("last_price")
-            if p: curve[f"M{n}"] = round(float(p), 2)
-        except Exception:
-            pass
-
-    # slope 계산
-    m1 = curve.get("M1")
-    if m1 and m1 > 0:
-        if curve.get("M6"):
-            curve["slope"] = round((curve["M6"] - m1) / m1 * 2 * 100, 3)
-        elif curve.get("M3"):
-            curve["slope"] = round((curve["M3"] - m1) / m1 * 4 * 100, 3)
-
-    # fallback: 역사적 가격 변화
-    if "slope" not in curve:
-        try:
-            df = yf.download("CL=F", period="6mo", interval="1d",
-                             progress=False, auto_adjust=True)
-            cl = df["Close"].dropna().values.flatten()
-            if len(cl) > 60:
-                curve["slope"] = round(float(cl[-1] - cl[-60]) / cl[-60] * (12/3) * 100, 3)
-                if "M1" not in curve:
-                    curve["M1"] = round(float(cl[-1]), 2)
-        except Exception:
-            pass
-
-    curve["contango"] = curve.get("slope", 0) > 0
-    return curve
-
-
-def fetch_all_data(force: bool = False) -> dict:
-    """통합 크롤링: yfinance + EIA + PortWatch."""
-    now = datetime.datetime.now()
-    if (not force and _cache["data"] is not None
-            and (now - _cache["ts"]).seconds < CACHE_TTL):
-        return _cache["data"]
-
-    status: dict = {"crawled_at": now.strftime("%Y-%m-%d %H:%M:%S"), "sources": {}}
-
-    # ── [1] yfinance 배치 다운로드 ───────────────────────────
-    yf_name_map = {
-        "CL=F":     "WTI",   "BZ=F":      "Brent",
-        "DX-Y.NYB": "DXY",   "^OVX":      "OVX",
-        "USO":      "USO",   "BNO":       "BNO",
-    }
-    mkt: dict = {}
-    try:
-        raw_batch = yf.download(
-            list(yf_name_map.keys()),
-            period="1y", interval="1d",
-            progress=False, auto_adjust=True, group_by="ticker",
-        )
-    except Exception:
-        raw_batch = pd.DataFrame()
-
-    for ticker, name in yf_name_map.items():
-        try:
-            try:
-                col = raw_batch[ticker]["Close"] if (
-                    not raw_batch.empty and
-                    ticker in raw_batch.columns.get_level_values(0)
-                ) else None
-            except Exception:
-                col = None
-
-            if col is None or col.dropna().empty:
-                df_s = yf.download(ticker, period="1y", interval="1d",
-                                   progress=False, auto_adjust=True)
-                col = df_s["Close"].dropna() if not df_s.empty else pd.Series(dtype=float)
-
-            closes = col.dropna() if hasattr(col, "dropna") else pd.Series(dtype=float)
-            if closes.empty:
-                raise ValueError("empty")
-
-            arr   = closes.values.astype(float).flatten()
-            idx   = closes.index
-            dates = (idx.strftime("%Y-%m-%d")
-                     if hasattr(idx, "strftime") else [str(d)[:10] for d in idx])
-
-            mkt[name] = {
-                "series":  arr,
-                "latest":  float(arr[-1]),
-                "chg":     float(arr[-1] - arr[-2]) if len(arr) > 1 else 0.0,
-                "chg_pct": float((arr[-1] / arr[-2] - 1) * 100) if len(arr) > 1 else 0.0,
-            }
-            status["sources"][name] = "LIVE (Yahoo Finance)"
-            _save_csv(
-                f"yahoo_finance_{name.lower()}.csv",
-                pd.DataFrame({"date": dates, "close": arr,
-                              "ticker": ticker, "source": "Yahoo Finance"}),
-            )
-        except Exception as e:
-            mkt[name] = None
-            status["sources"][name] = f"FAIL ({e})"
-
-    # ── WTI 선물 커브 (M1~M6) ─────────────────────────────
-    curve = _futures_curve_yf()
-    slope = curve.get("slope")
-    if slope is not None:
-        mkt["futures_slope"] = slope
-        mkt["futures_curve"] = curve
-        status["sources"]["futures_slope"] = (
-            f"LIVE (Yahoo Finance WTI curve: "
-            f"M1={curve.get('M1','?')} M3={curve.get('M3','?')} M6={curve.get('M6','?')})"
-        )
-        _save_csv(
-            "yahoo_finance_futures_curve.csv",
-            pd.DataFrame([{
-                "crawled_at": now.strftime("%Y-%m-%d %H:%M:%S"),
-                "M1": curve.get("M1"), "M2": curve.get("M2"),
-                "M3": curve.get("M3"), "M6": curve.get("M6"),
-                "slope_annualized_pct": slope,
-                "contango": curve.get("contango"),
-                "source": "Yahoo Finance (WTI CL= futures curve)",
-            }]),
-        )
-    else:
-        mkt["futures_slope"] = None
-        mkt["futures_curve"] = {}
-        status["sources"]["futures_slope"] = "SIM (yfinance 선물 실패)"
-
-    # ── [2b] FRED WTI & Brent (보조 검증, 무료, API 키 불필요) ─
-    for name, fid in [("FRED_WTI", "DCOILWTICO"), ("FRED_Brent", "DCOILBRENTEU")]:
-        arr_f, dates_f = _fred_series(fid)
-        if arr_f is not None and len(arr_f) > 10:
-            mkt[name] = {"series": arr_f, "latest": float(arr_f[-1]),
-                         "chg": float(arr_f[-1] - arr_f[-2]) if len(arr_f) > 1 else 0.0}
-            status["sources"][name] = f"LIVE (FRED {fid}, n={len(arr_f)}일)"
-            short = name.replace("FRED_", "").lower()
-            _save_csv(
-                f"fred_{short}.csv",
-                pd.DataFrame({"date": dates_f, "price_usd": arr_f,
-                              "series_id": fid,
-                              "source": "FRED St. Louis Fed (public CSV, no key)"}),
-            )
-        else:
-            mkt[name] = None
-            status["sources"][name] = f"FAIL (FRED {fid})"
-
-    # ── Brent-WTI 스프레드 (직접 계산) ────────────────────
-    wti_s   = mkt.get("WTI",   {}).get("series") if mkt.get("WTI")   else None
-    brent_s = mkt.get("Brent", {}).get("series") if mkt.get("Brent") else None
-    if wti_s is not None and brent_s is not None:
-        n_sp = min(len(wti_s), len(brent_s))
-        sp   = brent_s[-n_sp:] - wti_s[-n_sp:]
-        mkt["brent_wti_spread"] = {"series": sp, "latest": float(sp[-1])}
-        status["sources"]["brent_wti_spread"] = (
-            f"LIVE (Brent-WTI, 현재 ${sp[-1]:+.2f}, n={n_sp}일)"
-        )
-        _save_csv(
-            "brent_wti_spread.csv",
-            pd.DataFrame({"index": range(n_sp), "spread_usd": sp,
-                          "source": "Calculated (Brent - WTI from yfinance)"}),
-        )
-    else:
-        mkt["brent_wti_spread"] = None
-        status["sources"]["brent_wti_spread"] = "SIM (Brent/WTI 없음)"
-
-    # ── [2] EIA API (DEMO_KEY) ─────────────────────────────
-    import time as _time
-    _time.sleep(2)   # DEMO_KEY rate limit 완화
-    # 상업재고 (excl SPR): process=SAX → WCESTUS1
-    rows_excl = _eia_fetch(
-        "petroleum/stoc/wstk/data/",
-        {"facets[product][]": "EPC0", "facets[duoarea][]": "NUS",
-         "facets[process][]": "SAX"},
-        length=60,
-    )
-    arr_excl = _eia_series(rows_excl)
-    if len(arr_excl) > 1:
-        mkt["eia_stock"] = arr_excl
-        status["sources"]["eia_stock"] = f"LIVE (EIA DEMO_KEY, n={len(arr_excl)}주)"
-        # ── CSV 저장: eia_commercial_inventory ────────────
-        if rows_excl:
-            _save_csv(
-                "eia_commercial_inventory.csv",
-                pd.DataFrame([{
-                    "period":             r.get("period"),
-                    "value_mbbl":         r.get("value"),
-                    "series":             r.get("series"),
-                    "series_description": r.get("series-description"),
-                    "units":              r.get("units"),
-                    "duoarea":            r.get("duoarea"),
-                    "source":             "EIA Open Data API v2 (DEMO_KEY)",
-                } for r in rows_excl]),
-            )
-    else:
-        mkt["eia_stock"] = None
-        status["sources"]["eia_stock"] = "SIM (EIA 응답 없음)"
-
-    # 전체재고 (incl SPR): process=SAE → WCRSTUS1
-    _time.sleep(3)
-    rows_total = _eia_fetch(
-        "petroleum/stoc/wstk/data/",
-        {"facets[product][]": "EPC0", "facets[duoarea][]": "NUS",
-         "facets[process][]": "SAE"},
-        length=60,
-    )
-    arr_total = _eia_series(rows_total)
-    # SPR = 전체 - 상업
-    if len(arr_total) > 1 and len(arr_excl) > 1:
-        n = min(len(arr_total), len(arr_excl))
-        spr = arr_total[-n:] - arr_excl[-n:]
-        mkt["spr_level"] = spr
-        status["sources"]["spr_level"] = f"LIVE (EIA 유도: total-excl, n={n}주)"
-        # ── CSV 저장: eia_spr ──────────────────────────────
-        if rows_total:
-            rows_total_rev = list(reversed(rows_total))
-            rows_excl_rev  = list(reversed(rows_excl))
-            spr_rows = []
-            for i in range(n):
-                spr_rows.append({
-                    "period":           rows_total_rev[i].get("period"),
-                    "total_stocks_mbbl": float(rows_total_rev[i].get("value", 0) or 0),
-                    "excl_spr_mbbl":    float(rows_excl_rev[i].get("value", 0) or 0),
-                    "spr_derived_mbbl": float(rows_total_rev[i].get("value", 0) or 0)
-                                       - float(rows_excl_rev[i].get("value", 0) or 0),
-                    "source": "EIA Open Data API v2 (derived: total - excl_SPR)",
-                })
-            _save_csv("eia_spr.csv", pd.DataFrame(spr_rows))
-    else:
-        mkt["spr_level"] = None
-        status["sources"]["spr_level"] = "SIM (EIA 유도 실패)"
-
-    # 미국 생산량 (주간) → 공급 갭 프록시
-    _time.sleep(3)
-    rows_prod = _eia_fetch(
-        "petroleum/sum/snd/data/",
-        {"facets[duoarea][]": "NUS", "facets[product][]": "EPC0",
-         "facets[process][]": "FPD"},
-        length=60,
-    )
-    arr_prod = _eia_series(rows_prod)
-    if len(arr_prod) > 4:
-        d_prod = np.diff(arr_prod, prepend=arr_prod[0])
-        mkt["supply_gap"] = d_prod / 100.0
-        status["sources"]["supply_gap"] = f"LIVE (EIA 생산량 차분, n={len(arr_prod)}주)"
-        # ── CSV 저장: eia_us_production ───────────────────
-        _save_csv(
-            "eia_us_production.csv",
-            pd.DataFrame([{
-                "period":                  r.get("period"),
-                "value":                   r.get("value"),
-                "series":                  r.get("series"),
-                "series_description":      r.get("series-description"),
-                "units":                   r.get("units"),
-                "source":                  "EIA Open Data API v2 (DEMO_KEY)",
-            } for r in rows_prod]),
-        )
-    else:
-        mkt["supply_gap"] = None
-        status["sources"]["supply_gap"] = "SIM (EIA 생산 응답 없음)"
-
-    # ── [2c] 매크로 지표 (yfinance) ────────────────────────
-    macro = _yf_macro()
-    mkt["macro"] = macro
-    macro_csv_rows = []
-    for name, info in macro.items():
-        status["sources"][f"macro_{name}"] = (
-            f"LIVE (yfinance {info['ticker']}, n={len(info['series'])}일)"
-        )
-        arr = info["series"]
-        macro_csv_rows.append({
-            "name":       name,
-            "ticker":     info["ticker"],
-            "latest":     info["latest"],
-            "chg_pct":    info["chg_pct"],
-            "n_days":     len(arr),
-            "crawled_at": now.strftime("%Y-%m-%d %H:%M:%S"),
-        })
-    if macro_csv_rows:
-        _save_csv("macro_snapshot.csv", pd.DataFrame(macro_csv_rows))
-
-    # ── [2d] EIA WPSR 추가 수급 시리즈 ─────────────────────
-    wpsr = _eia_wpsr()
-    mkt["wpsr"] = wpsr
-    for name in ("gasoline", "distillate", "crude_imports"):
-        arr = wpsr.get(name)
-        if arr is not None:
-            status["sources"][f"wpsr_{name}"] = (
-                f"LIVE (EIA WPSR {name}, n={len(arr)}주)"
-            )
-            rows_k = wpsr.get(f"{name}_rows", [])
-            if rows_k:
-                _save_csv(
-                    f"eia_wpsr_{name}.csv",
-                    pd.DataFrame([{
-                        "period": r.get("period"), "value": r.get("value"),
-                        "units": r.get("units"), "series": r.get("series"),
-                        "source": "EIA WPSR v2",
-                    } for r in rows_k]),
-                )
-        else:
-            status["sources"][f"wpsr_{name}"] = f"SIM (EIA WPSR {name} 없음)"
-
-    # ── [3] ArcGIS 호르무즈 일별 선박 데이터 ──────────────
-    arcgis = _arcgis_hormuz(n_records=365)
-    if arcgis and not arcgis.get("error"):
-        mkt["arcgis_hormuz"] = arcgis
-        n_ag = len(arcgis["n_tanker"])
-        status["sources"]["vessel_data"] = (
-            f"LIVE (ArcGIS chokepoint6 Daily, n={n_ag})"
-        )
-        _save_csv(
-            "arcgis_hormuz.csv",
-            pd.DataFrame({
-                "date":            arcgis["dates"],
-                "n_tanker":        arcgis["n_tanker"],
-                "n_total":         arcgis["n_total"],
-                "n_dry_bulk":      arcgis["n_dry_bulk"],
-                "n_container":     arcgis["n_container"],
-                "n_roro":          arcgis["n_roro"],
-                "capacity_tanker": arcgis["capacity_tanker"],
-                "capacity":        arcgis["capacity"],
-                "tanker_ratio":    arcgis["tanker_ratio"],
-                "source":          "ArcGIS FeatureServer (IMF PortWatch chokepoint6)",
-            }),
-        )
-    else:
-        mkt["arcgis_hormuz"] = None
-        status["sources"]["vessel_data"] = (
-            f"PROXY (ArcGIS 실패: {arcgis.get('error','no data')} → 시장 프록시)"
-        )
-
-    # ── [4] straits.live 현황 스크래핑 ─────────────────────
-    straits = _straits_live_scrape()
-    if straits and not straits.get("error"):
-        mkt["straits_live"] = straits
-        status["sources"]["straits_live"] = (
-            f"LIVE (straits.live: {straits.get('scraped_at','')})"
-        )
-        _save_csv("straits_live_snapshot.csv", pd.DataFrame([straits]))
-    else:
-        mkt["straits_live"] = None
-        status["sources"]["straits_live"] = (
-            f"FAIL (straits.live: {straits.get('error','no data')})"
-        )
-
-    _cache["data"] = {**mkt, **status}
-    _cache["ts"]   = now
-    return _cache["data"]
 
 
 # ══════════════════════════════════════════════════════════
-# 2. 보조 함수
+# 2. 보조 함수  (크롤링은 data_crawler.py 참조)
 # ══════════════════════════════════════════════════════════
 def _align(arr, T: int, rng, mu: float, sigma: float) -> np.ndarray:
     if arr is None or len(arr) == 0:
@@ -1075,11 +403,15 @@ def build_feature_matrix(mkt: dict) -> pd.DataFrame:
 
 def run_ml_forecast(df: pd.DataFrame) -> dict:
     """
-    TimeSeriesSplit + RandomizedSearchCV로 RF 하이퍼파라미터 튜닝.
-    각 FORECAST_HORIZONS(7/14/30/60/90d)에 대해 최적 모델 학습 후 예측.
+    2단계 분류→회귀 파이프라인.
+    Stage 1 (RF Classifier): 방향 분류 (-1=하락, 0=중립, +1=상승)
+    Stage 2 (RF Regressor) : 수익률 크기 예측
+    Final                  : 방향 신뢰도 × 크기 결합 → 최종 예측 수익률
     """
     from sklearn.model_selection import TimeSeriesSplit, RandomizedSearchCV
-    from sklearn.metrics import mean_absolute_error, r2_score
+    from sklearn.metrics import mean_absolute_error, r2_score, balanced_accuracy_score
+
+    DIRECTION_THRESHOLD = 0.005  # ±0.5% 이내는 중립(0)
 
     if df.empty:
         return {}
@@ -1087,7 +419,14 @@ def run_ml_forecast(df: pd.DataFrame) -> dict:
     feat_cols = [c for c in df.columns
                  if not c.startswith("target_") and c != "oil_price"]
 
-    param_grid = {
+    clf_param_grid = {
+        "n_estimators":      [50, 100, 200],
+        "max_depth":         [3, 5, 7, None],
+        "min_samples_split": [2, 5, 10],
+        "min_samples_leaf":  [1, 2, 4],
+        "max_features":      ["sqrt", "log2"],
+    }
+    reg_param_grid = {
         "n_estimators":      [50, 100, 200, 300],
         "max_depth":         [3, 5, 7, 10, None],
         "min_samples_split": [2, 5, 10],
@@ -1107,41 +446,86 @@ def run_ml_forecast(df: pd.DataFrame) -> dict:
         if len(df_c) < 40:
             continue
 
-        X = df_c[feat_cols].values
-        y = df_c[tcol].values
+        X   = df_c[feat_cols].values
+        y_ret = df_c[tcol].values
+        # 방향 레이블: +1/0/-1
+        y_dir = np.where(y_ret >  DIRECTION_THRESHOLD,  1,
+                np.where(y_ret < -DIRECTION_THRESHOLD, -1, 0))
 
-        split   = int(len(X) * 0.8)
-        X_train, X_test = X[:split], X[split:]
-        y_train, y_test = y[:split], y[split:]
+        split = int(len(X) * 0.8)
+        X_train, X_test     = X[:split],     X[split:]
+        y_ret_tr, y_ret_te  = y_ret[:split], y_ret[split:]
+        y_dir_tr, y_dir_te  = y_dir[:split], y_dir[split:]
 
-        model = RandomForestRegressor(random_state=42, n_jobs=-1)
-        search = RandomizedSearchCV(
-            estimator=model,
-            param_distributions=param_grid,
-            n_iter=20,          # 웹 앱 응답 속도: 20회 (full study: 50)
+        # ── Stage 1: 방향 분류 (RF Classifier) ───────────
+        clf = RandomForestClassifier(
+            random_state=42, n_jobs=-1, class_weight="balanced"
+        )
+        clf_search = RandomizedSearchCV(
+            estimator=clf,
+            param_distributions=clf_param_grid,
+            n_iter=20,
+            cv=tscv,
+            scoring="balanced_accuracy",
+            n_jobs=-1,
+            random_state=42,
+            refit=True,
+        )
+        clf_search.fit(X_train, y_dir_tr)
+        best_clf = clf_search.best_estimator_
+
+        dir_pred_test = best_clf.predict(X_test) if len(X_test) > 0 else np.array([0])
+        dir_acc = float(balanced_accuracy_score(y_dir_te, dir_pred_test)) if len(y_dir_te) > 0 else 0.0
+
+        dir_latest      = int(best_clf.predict(X[-1:])[0])
+        dir_proba_all   = best_clf.predict_proba(X[-1:])[0]
+        dir_classes     = list(best_clf.classes_)
+        dir_proba_dict  = {int(c): round(float(p), 4)
+                           for c, p in zip(dir_classes, dir_proba_all)}
+
+        # ── Stage 2: 수익률 회귀 (RF Regressor) ──────────
+        reg = RandomForestRegressor(random_state=42, n_jobs=-1)
+        reg_search = RandomizedSearchCV(
+            estimator=reg,
+            param_distributions=reg_param_grid,
+            n_iter=20,
             cv=tscv,
             scoring="neg_mean_absolute_error",
             n_jobs=-1,
             random_state=42,
             refit=True,
         )
-        search.fit(X_train, y_train)
-        best_model = search.best_estimator_
+        reg_search.fit(X_train, y_ret_tr)
+        best_reg = reg_search.best_estimator_
 
-        pred = best_model.predict(X_test) if len(X_test) > 0 else np.array([0.0])
-        mae  = float(mean_absolute_error(y_test, pred)) if len(y_test) > 0 else 0.0
-        r2   = float(r2_score(y_test, pred))            if len(y_test) > 1 else 0.0
+        reg_pred_test = best_reg.predict(X_test) if len(X_test) > 0 else np.array([0.0])
+        mae = float(mean_absolute_error(y_ret_te, reg_pred_test)) if len(y_ret_te) > 0 else 0.0
+        r2  = float(r2_score(y_ret_te, reg_pred_test))            if len(y_ret_te) > 1 else 0.0
 
-        pred_latest = float(best_model.predict(X[-1:])[0])
+        reg_latest = float(best_reg.predict(X[-1:])[0])
+
+        # ── 결합: 방향 신뢰도 × 크기 ─────────────────────
+        if dir_latest == 0:
+            pred_return = reg_latest * 0.2        # 중립: 크기 감쇠
+        elif np.sign(reg_latest) == dir_latest:
+            pred_return = reg_latest              # 방향 일치: 그대로
+        else:
+            # 방향 불일치: 분류기 방향으로 부호 반전, 크기 50%
+            pred_return = abs(reg_latest) * 0.5 * dir_latest
+
+        dir_label_map = {1: "상승(▲)", 0: "중립(─)", -1: "하락(▼)"}
+        dir_label     = dir_label_map.get(dir_latest, "?")
 
         results[h] = {
-            "best_params":  search.best_params_,
+            "dir_label":    dir_label,
+            "dir_acc":      round(dir_acc, 4),
+            "dir_proba":    dir_proba_dict,
             "mae":          round(mae, 5),
             "r2":           round(r2, 4),
-            "pred_return":  round(pred_latest, 5),
-            "pred_price":   round(float(df["oil_price"].iloc[-1]) * (1 + pred_latest), 2),
+            "pred_return":  round(pred_return, 5),
+            "pred_price":   round(float(df["oil_price"].iloc[-1]) * (1 + pred_return), 2),
             "importances":  {f: round(float(v), 4)
-                             for f, v in zip(feat_cols, best_model.feature_importances_)},
+                             for f, v in zip(feat_cols, best_reg.feature_importances_)},
         }
 
     return results
@@ -1531,41 +915,48 @@ def chart_ml(ml: dict, df_feat: pd.DataFrame) -> str:
     horizons = sorted(ml.keys())
     labels   = [f"+{h}d" for h in horizons]
 
-    # ── [0,0] 예측 수익률 바 차트 ────────────────────────
+    # ── [0,0] 예측 수익률 + 방향 레이블 ─────────────────────
     rets   = [ml[h]["pred_return"] * 100 for h in horizons]
+    dir_lbls = [ml[h].get("dir_label", "?") for h in horizons]
     colors = [L_GREEN if r >= 0 else L_RED for r in rets]
     bars   = ax1.bar(labels, rets, color=colors, alpha=0.8, width=0.5, edgecolor=L_BORDER)
     ax1.axhline(0, color=L_TEXT, lw=0.8, ls="--")
-    for bar, r in zip(bars, rets):
+    for bar, r, dl in zip(bars, rets, dir_lbls):
         ax1.text(bar.get_x() + bar.get_width() / 2,
                  bar.get_height() + (0.05 if r >= 0 else -0.15),
                  f"{r:+.2f}%", ha="center", va="bottom", fontsize=8,
                  fontweight="bold", color=L_GREEN if r >= 0 else L_RED)
-    # 예측 가격 보조 텍스트
+        ax1.text(bar.get_x() + bar.get_width() / 2,
+                 0.02 if r >= 0 else -0.02,
+                 dl, ha="center", va="bottom" if r >= 0 else "top",
+                 fontsize=7, color=L_TEXT, alpha=0.75)
     for i, h in enumerate(horizons):
         ax1.text(i, min(rets) - 0.3,
                  f"${ml[h]['pred_price']:.1f}",
                  ha="center", va="top", fontsize=7, color=L_SUB)
-    ax1.set_title("RF 예측 수익률 (지평별)", color=L_TEXT,
+    ax1.set_title("분류→회귀 예측 수익률 (지평별)", color=L_TEXT,
                   fontsize=10, fontweight="bold")
     ax1.set_ylabel("Predicted Return (%)", color=L_TEXT, fontsize=8)
 
-    # ── [0,1] MAE / R² 성능 ──────────────────────────────
-    maes = [ml[h]["mae"] * 100 for h in horizons]
-    r2s  = [ml[h]["r2"]       for h in horizons]
-    x    = np.arange(len(horizons))
-    w    = 0.35
-    b1   = ax2.bar(x - w/2, maes, w, label="MAE (%)",
-                   color=L_ORANGE, alpha=0.8, edgecolor=L_BORDER)
+    # ── [0,1] 방향 분류 정확도 + MAE/R² ────────────────────
+    dir_accs = [ml[h].get("dir_acc", 0) * 100 for h in horizons]
+    maes     = [ml[h]["mae"] * 100 for h in horizons]
+    r2s      = [ml[h]["r2"]        for h in horizons]
+    x        = np.arange(len(horizons))
+    w        = 0.3
+    ax2.bar(x - w, dir_accs, w, label="방향 정확도 (%)",
+            color=L_PURPLE, alpha=0.8, edgecolor=L_BORDER)
+    ax2.bar(x,     maes,     w, label="회귀 MAE (%)",
+            color=L_ORANGE, alpha=0.8, edgecolor=L_BORDER)
     ax2r = ax2.twinx()
     ax2r.plot(x, r2s, "o--", color=L_BLUE, lw=2, ms=6, label="R²")
     ax2r.set_ylabel("R²", color=L_BLUE, fontsize=8)
     ax2r.tick_params(colors=L_BLUE, labelsize=8)
     ax2r.set_ylim(-0.2, 1.0)
     ax2.set_xticks(x); ax2.set_xticklabels(labels)
-    ax2.set_title("모델 성능 (MAE / R²)", color=L_TEXT,
+    ax2.set_title("모델 성능 (방향정확도 / MAE / R²)", color=L_TEXT,
                   fontsize=10, fontweight="bold")
-    ax2.set_ylabel("MAE (%)", color=L_ORANGE, fontsize=8)
+    ax2.set_ylabel("%", color=L_TEXT, fontsize=8)
     lines1, lbs1 = ax2.get_legend_handles_labels()
     lines2, lbs2 = ax2r.get_legend_handles_labels()
     ax2.legend(lines1 + lines2, lbs1 + lbs2, fontsize=7,
@@ -1601,7 +992,7 @@ def chart_ml(ml: dict, df_feat: pd.DataFrame) -> str:
     ax3.set_xlabel("Mean Feature Importance", color=L_TEXT, fontsize=8)
 
     fig.suptitle(
-        f"ML 유가 예측 (RandomForest + TimeSeriesSplit CV + RandomizedSearchCV)  "
+        f"ML 유가 예측 (RF 분류→회귀 2단계 + TimeSeriesSplit CV)  "
         f"│  Horizons: {FORECAST_HORIZONS}",
         fontsize=11, fontweight="bold", color=L_TEXT, y=0.999,
     )
@@ -2010,25 +1401,29 @@ footer{text-align:center;padding:20px;font-size:.78rem;color:#57606a;border-top:
 <table class="fc-table">
 <tr>
   <th>&#xC9C0;&#xD3C9;</th>
+  <th>&#xBC29;&#xD5A5; (&#xBD84;&#xB958;)</th>
+  <th>&#xBC29;&#xD5A5; &#xC815;&#xD655;&#xB3C4;</th>
   <th>&#xC608;&#xCE21; &#xC218;&#xC775;&#xB960;</th>
   <th>&#xC608;&#xCE21; &#xAC00;&#xACA9;</th>
-  <th>MAE</th>
+  <th>&#xD68C;&#xADC0; MAE</th>
   <th>R&#xB178;</th>
-  <th>&#xBCA0;&#xC2A4;&#xD2B8; n_estimators</th>
-  <th>&#xBCA0;&#xC2A4;&#xD2B8; max_depth</th>
 </tr>
 {% for h in [7,14,30,60,90] %}{% if h in ml %}
 {% set info = ml[h] %}
 <tr>
   <td><strong>+{{ h }}&#xC77C;</strong></td>
+  <td class="{{ 'cg' if '&#xC0C1;&#xC2B9;' in info.dir_label else ('cr' if '&#xD558;&#xB77D;' in info.dir_label else 'cy') }}">
+    {{ info.dir_label }}
+  </td>
+  <td class="{{ 'cg' if info.dir_acc>=0.6 else ('cy' if info.dir_acc>=0.45 else 'cr') }}">
+    {{ "%.1f"|format(info.dir_acc*100) }}%
+  </td>
   <td class="{{ 'cg' if info.pred_return>=0 else 'cr' }}">
     {{ '%+.2f'|format(info.pred_return*100) }}%
   </td>
   <td class="{{ 'cg' if info.pred_return>=0 else 'cr' }}">${{ "%.1f"|format(info.pred_price) }}</td>
   <td class="cy">{{ "%.4f"|format(info.mae*100) }}%</td>
   <td class="{{ 'cg' if info.r2>0.1 else 'cr' }}">{{ "%.3f"|format(info.r2) }}</td>
-  <td>{{ info.best_params.get('n_estimators','?') }}</td>
-  <td>{{ info.best_params.get('max_depth','?') }}</td>
 </tr>
 {% endif %}{% endfor %}
 </table>

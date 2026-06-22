@@ -1,4 +1,5 @@
 ﻿period,value_mbbl,series,series_description,units,duoarea,source
+2026-06-12,418222,WCESTUS1,U.S. Ending Stocks excluding SPR of Crude Oil (Thousand Barrels),MBBL,NUS,EIA Open Data API v2 (DEMO_KEY)
 2026-06-05,426485,WCESTUS1,U.S. Ending Stocks excluding SPR of Crude Oil (Thousand Barrels),MBBL,NUS,EIA Open Data API v2 (DEMO_KEY)
 2026-05-29,433712,WCESTUS1,U.S. Ending Stocks excluding SPR of Crude Oil (Thousand Barrels),MBBL,NUS,EIA Open Data API v2 (DEMO_KEY)
 2026-05-22,441686,WCESTUS1,U.S. Ending Stocks excluding SPR of Crude Oil (Thousand Barrels),MBBL,NUS,EIA Open Data API v2 (DEMO_KEY)
@@ -58,4 +59,3 @@
 2025-05-09,441830,WCESTUS1,U.S. Ending Stocks excluding SPR of Crude Oil (Thousand Barrels),MBBL,NUS,EIA Open Data API v2 (DEMO_KEY)
 2025-05-02,438376,WCESTUS1,U.S. Ending Stocks excluding SPR of Crude Oil (Thousand Barrels),MBBL,NUS,EIA Open Data API v2 (DEMO_KEY)
 2025-04-25,440408,WCESTUS1,U.S. Ending Stocks excluding SPR of Crude Oil (Thousand Barrels),MBBL,NUS,EIA Open Data API v2 (DEMO_KEY)
-2025-04-18,443104,WCESTUS1,U.S. Ending Stocks excluding SPR of Crude Oil (Thousand Barrels),MBBL,NUS,EIA Open Data API v2 (DEMO_KEY)

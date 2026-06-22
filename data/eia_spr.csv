@@ -1,5 +1,4 @@
 ﻿period,total_stocks_mbbl,excl_spr_mbbl,spr_derived_mbbl,source
-2025-04-18,840581.0,443104.0,397477.0,EIA Open Data API v2 (derived: total - excl_SPR)
 2025-04-25,838950.0,440408.0,398542.0,EIA Open Data API v2 (derived: total - excl_SPR)
 2025-05-02,837498.0,438376.0,399122.0,EIA Open Data API v2 (derived: total - excl_SPR)
 2025-05-09,841480.0,441830.0,399650.0,EIA Open Data API v2 (derived: total - excl_SPR)
@@ -59,3 +58,4 @@
 2026-05-22,806798.0,441686.0,365112.0,EIA Open Data API v2 (derived: total - excl_SPR)
 2026-05-29,790831.0,433712.0,357119.0,EIA Open Data API v2 (derived: total - excl_SPR)
 2026-06-05,775677.0,426485.0,349192.0,EIA Open Data API v2 (derived: total - excl_SPR)
+2026-06-12,758473.0,418222.0,340251.0,EIA Open Data API v2 (derived: total - excl_SPR)
