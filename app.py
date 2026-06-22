@@ -24,7 +24,17 @@ import requests
 from data_crawler import fetch_all_data, CSV_DIR, EIA_KEY, EIA_BASE, _cache
 
 warnings.filterwarnings("ignore")
-matplotlib.rcParams["font.family"] = "DejaVu Sans"
+def _set_korean_font():
+    import matplotlib.font_manager as fm
+    candidates = ["Malgun Gothic", "AppleGothic", "NanumGothic", "NanumBarunGothic", "DejaVu Sans"]
+    available = {f.name for f in fm.fontManager.ttflist}
+    for name in candidates:
+        if name in available:
+            matplotlib.rcParams["font.family"] = name
+            break
+    matplotlib.rcParams["axes.unicode_minus"] = False
+
+_set_korean_font()
 
 app = Flask(__name__)
 
